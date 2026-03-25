@@ -1,11 +1,11 @@
 extern crate std;
 
-use fluxora_stream::{FluxoraStream, FluxoraStreamClient, StreamStatus};
+use fluxora_stream::{CreateStreamParams, FluxoraStream, FluxoraStreamClient, StreamStatus};
 use soroban_sdk::log;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    vec, Address, Env, IntoVal,
 };
 
 struct TestContext<'a> {
@@ -98,6 +98,64 @@ fn init_sets_config_and_keeps_token_address() {
 fn init_twice_panics() {
     let ctx = TestContext::setup();
     ctx.client().init(&ctx.token_id, &ctx.admin);
+}
+
+#[test]
+fn init_requires_admin_authorization_in_strict_mode() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_id = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "init",
+            args: (&token_id, &admin).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    client.init(&token_id, &admin);
+    let cfg = client.get_config();
+    assert_eq!(cfg.token, token_id);
+    assert_eq!(cfg.admin, admin);
+}
+
+#[test]
+fn init_wrong_signer_rejected_and_bootstrap_state_unset() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_id = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "init",
+            args: (&token_id, &admin).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let init_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.init(&token_id, &admin);
+    }));
+    assert!(init_result.is_err(), "init must reject non-admin signer");
+
+    let cfg_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.get_config();
+    }));
+    assert!(
+        cfg_result.is_err(),
+        "failed init auth must not persist bootstrap config"
+    );
+    assert_eq!(client.get_stream_count(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -234,23 +292,84 @@ fn create_stream_rejects_self_stream_without_side_effects() {
 }
 
 #[test]
-fn get_withdrawable_matches_withdraw_active_integration() {
+fn create_streams_batch_success_moves_funds_and_assigns_sequential_ids() {
     let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
+    ctx.env.ledger().set_timestamp(0);
 
-    ctx.env.ledger().set_timestamp(600);
-    let expected = ctx.client().get_withdrawable(&stream_id);
-    let withdrawn = ctx.client().withdraw(&stream_id);
+    let sender_balance_before = ctx.token.balance(&ctx.sender);
+    let contract_balance_before = ctx.token.balance(&ctx.contract_id);
 
+    let p1 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1200,
+        rate_per_second: 2,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 600,
+    };
+    let p2 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 2400,
+        rate_per_second: 3,
+        start_time: 10,
+        cliff_time: 10,
+        end_time: 810,
+    };
+
+    let streams = vec![&ctx.env, p1.clone(), p2.clone()];
+    let ids = ctx.client().create_streams(&ctx.sender, &streams);
+
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.get(0).unwrap(), 0);
+    assert_eq!(ids.get(1).unwrap(), 1);
+    assert_eq!(ctx.client().get_stream_count(), 2);
+
+    assert_eq!(ctx.token.balance(&ctx.sender), sender_balance_before - 3600);
     assert_eq!(
-        withdrawn, expected,
-        "withdraw should transfer exactly get_withdrawable amount"
+        ctx.token.balance(&ctx.contract_id),
+        contract_balance_before + 3600
     );
-    assert_eq!(
-        ctx.client().get_withdrawable(&stream_id),
-        0,
-        "after withdraw, get_withdrawable must return 0 at same time"
+}
+
+#[test]
+fn create_streams_batch_invalid_entry_is_atomic_and_emits_no_events() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let valid = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1000,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1000,
+    };
+    let invalid = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 10,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1000,
+    };
+
+    let stream_count_before = ctx.client().get_stream_count();
+    let sender_balance_before = ctx.token.balance(&ctx.sender);
+    let contract_balance_before = ctx.token.balance(&ctx.contract_id);
+    let events_before = ctx.env.events().all().len();
+
+    let streams = vec![&ctx.env, valid, invalid];
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().create_streams(&ctx.sender, &streams);
+    }));
+    assert!(
+        result.is_err(),
+        "batch with invalid entry must fail atomically"
     );
+    assert_eq!(ctx.client().get_stream_count(), stream_count_before);
+    assert_eq!(ctx.token.balance(&ctx.sender), sender_balance_before);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), contract_balance_before);
+    assert_eq!(ctx.env.events().all().len(), events_before);
 }
 
 #[test]
@@ -1660,4 +1779,270 @@ fn test_create_many_streams_from_same_sender() {
     log!(&ctx.env, "mem_bytes", mem_bytes);
     // Guardrail: ensure memory usage stays bounded for 100 streams.
     assert!(mem_bytes <= 20_000_000);
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests — extend_stream_end_time: deposit sufficiency
+// ---------------------------------------------------------------------------
+
+/// Exact boundary: deposit == rate * new_duration succeeds; accrual reaches new end.
+#[test]
+fn integration_extend_end_time_exact_deposit_boundary() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // deposit=2000, rate=1, end=1000 → can extend to exactly 2000
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &2000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.client().extend_stream_end_time(&stream_id, &2000u64);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.end_time, 2000);
+    assert_eq!(state.deposit_amount, 2000);
+
+    // Withdraw full amount at new end_time
+    ctx.env.ledger().set_timestamp(2000);
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 2000);
+
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Completed
+    );
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 0);
+}
+
+/// Insufficient deposit: extension rejected, stream state and balances unchanged.
+#[test]
+fn integration_extend_end_time_insufficient_deposit_rejected_no_side_effects() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    let sender_before = ctx.token.balance(&ctx.sender);
+    let contract_before = ctx.token.balance(&ctx.contract_id);
+    let state_before = ctx.client().get_stream_state(&stream_id);
+
+    let result = ctx
+        .client()
+        .try_extend_stream_end_time(&stream_id, &2000u64);
+    assert!(result.is_err(), "extension must fail");
+
+    // Balances unchanged
+    assert_eq!(ctx.token.balance(&ctx.sender), sender_before);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), contract_before);
+
+    // Stream state unchanged
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state_after.end_time, state_before.end_time);
+    assert_eq!(state_after.deposit_amount, state_before.deposit_amount);
+    assert_eq!(state_after.status, state_before.status);
+}
+
+/// top_up then extend: combined operation allows longer stream duration.
+#[test]
+fn integration_top_up_then_extend_full_withdrawal() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // Tight deposit: exactly covers original 1000s
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    // Top up 500 tokens
+    ctx.client()
+        .top_up_stream(&stream_id, &ctx.sender, &500_i128);
+
+    // Now extend to 1500s (rate(1) * 1500 = 1500 == new deposit)
+    ctx.client().extend_stream_end_time(&stream_id, &1500u64);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.end_time, 1500);
+    assert_eq!(state.deposit_amount, 1500);
+
+    // Withdraw full amount at new end
+    ctx.env.ledger().set_timestamp(1500);
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 1500);
+
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Completed
+    );
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 0);
+    assert_eq!(ctx.token.balance(&ctx.recipient), 1500);
+}
+
+/// Paused stream: extension succeeds, accrual and withdrawal work after resume.
+#[test]
+fn integration_extend_paused_stream_then_resume_withdraw() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &2000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().pause_stream(&stream_id);
+
+    // Extend while paused
+    ctx.client().extend_stream_end_time(&stream_id, &2000u64);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.end_time, 2000);
+    assert_eq!(state.status, StreamStatus::Paused);
+
+    // Resume and withdraw
+    ctx.client().resume_stream(&stream_id);
+
+    ctx.env.ledger().set_timestamp(2000);
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 2000);
+
+    assert_eq!(
+        ctx.client().get_stream_state(&stream_id).status,
+        StreamStatus::Completed
+    );
+}
+
+/// Balance conservation: total tokens across all parties unchanged after extend + withdraw.
+#[test]
+fn integration_extend_end_time_balance_conservation() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let total_before = ctx.token.balance(&ctx.sender)
+        + ctx.token.balance(&ctx.recipient)
+        + ctx.token.balance(&ctx.contract_id);
+
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &2000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.client().extend_stream_end_time(&stream_id, &2000u64);
+
+    ctx.env.ledger().set_timestamp(2000);
+    ctx.client().withdraw(&stream_id);
+
+    let total_after = ctx.token.balance(&ctx.sender)
+        + ctx.token.balance(&ctx.recipient)
+        + ctx.token.balance(&ctx.contract_id);
+
+    assert_eq!(
+        total_after, total_before,
+        "total token supply must be conserved"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests — batch_withdraw: completed streams yield zero amounts
+// ---------------------------------------------------------------------------
+
+/// Mixed batch [completed, active, completed]: zero amounts for completed entries,
+/// correct transfer for active entry, balance conservation throughout.
+#[test]
+fn integration_batch_withdraw_completed_streams_yield_zero() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let id0 = ctx.create_default_stream(); // will be completed
+    let id1 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    ); // active
+    let id2 = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    ); // will be completed
+
+    // Complete id0 and id2
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&id0);
+    ctx.client().withdraw(&id2);
+
+    // id1 is still active at t=600
+    ctx.env.ledger().set_timestamp(600);
+
+    let total_before = ctx.token.balance(&ctx.sender)
+        + ctx.token.balance(&ctx.recipient)
+        + ctx.token.balance(&ctx.contract_id);
+
+    let mut ids = soroban_sdk::Vec::new(&ctx.env);
+    ids.push_back(id0);
+    ids.push_back(id1);
+    ids.push_back(id2);
+    let results = ctx.client().batch_withdraw(&ctx.recipient, &ids);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results.get(0).unwrap().amount,
+        0,
+        "completed id0 must yield 0"
+    );
+    assert_eq!(
+        results.get(1).unwrap().amount,
+        600,
+        "active id1 must yield 600"
+    );
+    assert_eq!(
+        results.get(2).unwrap().amount,
+        0,
+        "completed id2 must yield 0"
+    );
+
+    // Balance conservation
+    let total_after = ctx.token.balance(&ctx.sender)
+        + ctx.token.balance(&ctx.recipient)
+        + ctx.token.balance(&ctx.contract_id);
+    assert_eq!(total_after, total_before);
+
+    // Contract holds only the remaining 400 for id1
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 400);
 }

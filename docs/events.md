@@ -30,6 +30,14 @@ Notes:
 | AdminUpdated     | `["AdminUpdated"]`              | `(old_admin: Address, new_admin: Address)`                                                                                                                | When the contract admin is rotated via `set_admin`.                                                                     |
 
 ---
+| Event name | Topic(s) | Data (shape & types) | When emitted |
+|---|---:|---|---|
+| StreamCreated | ["created", stream_id] | StreamCreated { stream_id: u64, sender: Address, recipient: Address, deposit_amount: i128, rate_per_second: i128, start_time: u64, cliff_time: u64, end_time: u64 } | When a stream is successfully created (after tokens transferred). The `stream_id` is the newly assigned stream id (u64). The event is published in `persist_new_stream`. Not emitted on failed creation (e.g., `StartTimeInPast`).
+| Withdrawal | ["withdrew", stream_id] | withdraw_amount: i128 | When a recipient successfully withdraws accrued tokens. Only emitted when amount > 0.
+| StreamPaused | ["paused", stream_id] | StreamEvent::Paused(stream_id) — enum wrapper containing the u64 stream id | When a stream is paused by the sender or admin.
+| StreamResumed | ["resumed", stream_id] | StreamEvent::Resumed(stream_id) — enum wrapper containing the u64 stream id | When a paused stream is resumed by the sender or admin.
+| StreamCancelled | ["cancelled", stream_id] | StreamEvent::StreamCancelled(stream_id) — enum wrapper containing the u64 stream id | When a stream is cancelled by the sender or admin.
+| AdminUpdated | ["admin", "updated"] | (old_admin: Address, new_admin: Address) | When contract admin is rotated via `set_admin`.
 
 ## Exact Soroban event structure
 
@@ -245,6 +253,18 @@ Example:
 
 This file is derived from `contracts/stream/src/lib.rs` emit calls:
 
+- `persist_new_stream` publishes `(symbol_short!("created"), stream_id), StreamCreated { ... }`
+- `withdraw` publishes `(symbol_short!("withdrew"), stream_id), withdrawable`
+- `pause_stream` / `pause_stream_as_admin` publish `(symbol_short!("paused"), stream_id), StreamEvent::Paused(stream_id)`
+- `resume_stream` / `resume_stream_as_admin` publish `(symbol_short!("resumed"), stream_id), StreamEvent::Resumed(stream_id)`
+- `cancel_stream` / `cancel_stream_as_admin` publish `(symbol_short!("cancelled"), stream_id), StreamEvent::StreamCancelled(stream_id)`
+- `set_admin` publishes `(symbol_short!("admin"), symbol_short!("updated")), (old_admin, new_admin)`
+
+If you change event topics or payloads in the contract, please update this
+document to match and include example snapshots.
+
+---
+Commit message suggestion: `docs: add event schema and topics for indexers`
 | Source location                                              | Symbol emitted  |
 |--------------------------------------------------------------|-----------------|
 | `persist_new_stream`                                         | `"created"`     |
